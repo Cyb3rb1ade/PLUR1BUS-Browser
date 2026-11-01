@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -151,7 +151,7 @@ test("delete() removes the temp download dir", async () => {
   }
 });
 
-test("saveAs cleans up the temp dir even when copyFile throws (nonexistent target parent)", async () => {
+test("saveAs preserves the download after a failed copy so saving can be retried", async () => {
   installAutoEgo();
   try {
     const promise = waitForEvent("download", { timeout: 1000 });
@@ -181,10 +181,19 @@ test("saveAs cleans up the temp dir even when copyFile throws (nonexistent targe
       /ENOENT/,
       "saveAs must reject when the target parent dir is missing",
     );
-    assert.ok(
-      !existsSync(tmpDir),
-      "temp dir must be removed even after a failed copy",
-    );
+    assert.equal(readFileSync(downloadedPath, "utf8"), "dummy");
+    const targetPath = join(tmpdir(), `ego-saveas-retry-${Date.now()}.bin`);
+    try {
+      assert.equal(await download.saveAs(targetPath), targetPath);
+      assert.equal(readFileSync(targetPath, "utf8"), "dummy");
+      assert.ok(
+        !existsSync(tmpDir),
+        "temp dir removed after the successful retry",
+      );
+    } finally {
+      await download.delete();
+      if (existsSync(targetPath)) unlinkSync(targetPath);
+    }
   } finally {
     cleanup();
   }

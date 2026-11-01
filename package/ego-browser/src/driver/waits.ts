@@ -283,8 +283,9 @@ async function waitForNetworkMatch(
       matched = processNetworkEvent(kind, matcher, event, requests, timeout);
       return Boolean(matched);
     }, browserEventTimeout(timeout));
-    await networkEvents.ready;
-    await eventReady;
+    // Observe both promises immediately: the event timeout can expire before
+    // Network.enable finishes, and must remain a catchable error.
+    await Promise.all([networkEvents.ready, eventReady]);
     return matched;
   } catch (error) {
     if (/page\.waitForEvent timed out/i.test(error?.message || "")) {

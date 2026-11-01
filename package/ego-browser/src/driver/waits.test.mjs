@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 
 import { setOverrides, state } from "../../dist/src/state.js";
 import { cdp } from "../../dist/src/cdp-eval.js";
@@ -945,9 +946,52 @@ test("waitForSelector accepts multiple matches and waits for the first by defaul
   );
 });
 
-// ---------------------------------------------------------------------------
-// (a) waitForNetworkMatch awaits networkEvents.ready before listening
-// ---------------------------------------------------------------------------
+for (const kind of ["Request", "Response"]) {
+  for (const enableFails of [false, true]) {
+    test(`waitFor${kind} handles timeout before a slow Network.enable ${enableFails ? "failure" : "success"}`, () => {
+      const stateUrl = new URL("../../dist/src/state.js", import.meta.url).href;
+      const waitsUrl = new URL(
+        "../../dist/src/driver/waits.js",
+        import.meta.url,
+      ).href;
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+            import assert from 'node:assert/strict';
+            import { setOverrides } from ${JSON.stringify(stateUrl)};
+            import { waitFor${kind} } from ${JSON.stringify(waitsUrl)};
+            const methods = [];
+            const restore = setOverrides({
+              cdpOverride: async (method) => {
+                methods.push(method);
+                if (method === 'Network.enable') {
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                  if (${enableFails}) throw new Error('Network.enable failed');
+                }
+                return {};
+              }
+            });
+            try {
+              await assert.rejects(
+                waitFor${kind}('https://example.com/never', { timeout: 10 }),
+                /page\\.waitFor${kind} timed out after 10ms/
+              );
+              assert.deepEqual(methods, ${JSON.stringify(enableFails ? ["Network.enable"] : ["Network.enable", "Network.disable"])});
+            } finally {
+              restore();
+            }
+          `,
+        ],
+        { encoding: "utf8", timeout: 3000 },
+      );
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+    });
+  }
+}
 
 test("waitForRequest catches a request fired after a slow Network.enable", async () => {
   // Regression guard for the void → await fix in waitForNetworkMatch.
