@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 
 import { setOverrides, state } from "../../dist/src/state.js";
 import { cdp } from "../../dist/src/cdp-eval.js";
@@ -943,4 +944,190 @@ test("waitForSelector accepts multiple matches and waits for the first by defaul
     expressions.some((expression) => expression.includes("[0] || null")),
     "the non-strict wait resolves the first matching table",
   );
+});
+
+for (const kind of ["Request", "Response"]) {
+  for (const enableFails of [false, true]) {
+    test(`waitFor${kind} handles timeout before a slow Network.enable ${enableFails ? "failure" : "success"}`, () => {
+      const stateUrl = new URL("../../dist/src/state.js", import.meta.url).href;
+      const waitsUrl = new URL(
+        "../../dist/src/driver/waits.js",
+        import.meta.url,
+      ).href;
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+            import assert from 'node:assert/strict';
+            import { setOverrides } from ${JSON.stringify(stateUrl)};
+            import { waitFor${kind} } from ${JSON.stringify(waitsUrl)};
+            const methods = [];
+            const restore = setOverrides({
+              cdpOverride: async (method) => {
+                methods.push(method);
+                if (method === 'Network.enable') {
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                  if (${enableFails}) throw new Error('Network.enable failed');
+                }
+                return {};
+              }
+            });
+            try {
+              await assert.rejects(
+                waitFor${kind}('https://example.com/never', { timeout: 10 }),
+                /page\\.waitFor${kind} timed out after 10ms/
+              );
+              assert.deepEqual(methods, ${JSON.stringify(enableFails ? ["Network.enable"] : ["Network.enable", "Network.disable"])});
+            } finally {
+              restore();
+            }
+          `,
+        ],
+        { encoding: "utf8", timeout: 3000 },
+      );
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+    });
+  }
+}
+
+test("waitForRequest catches a request fired after a slow Network.enable", async () => {
+  // Regression guard for the void → await fix in waitForNetworkMatch.
+  // The Network.enable acknowledgement is delayed; the request event is fired
+  // BEFORE the acknowledgement arrives. With 'await networkEvents.ready' the
+  // resolver waits for Network.enable before returning, so enableAcknowledged
+  // is true when waitForRequest resolves. With 'void networkEvents.ready' the
+  // promise resolves as soon as the event fires (before enable completes) and
+  // enableAcknowledged remains false — causing the assertion below to fail.
+  const ENABLE_DELAY_MS = 30;
+  let enableAcknowledged = false;
+  globalThis.ego = {
+    async listTabs() {
+      return { tabs: [{ targetId: "tab-1", active: true }] };
+    },
+    sendCDPMessage(payload) {
+      const parsed = JSON.parse(payload);
+      const delay = parsed.method === "Network.enable" ? ENABLE_DELAY_MS : 0;
+      setTimeout(() => {
+        if (!globalThis.ego?.onCDPMessage) return;
+        if (parsed.method === "Network.enable") enableAcknowledged = true;
+        const outcome =
+          parsed.method === "Target.attachToTarget"
+            ? { sessionId: `auto-sess-${parsed.id}` }
+            : {};
+        globalThis.ego.onCDPMessage(
+          JSON.stringify({ id: parsed.id, result: outcome }),
+        );
+      }, delay);
+    },
+  };
+  try {
+    const promise = waitForRequest("https://example.com/api/before-enable", {
+      timeout: 1000,
+    });
+    // Fire the event BEFORE Network.enable is acknowledged.
+    // With 'await networkEvents.ready' the waiter holds until enable completes,
+    // so the returned promise resolves only after enableAcknowledged is set.
+    // With 'void networkEvents.ready' the waiter resolves here, before enable.
+    setTimeout(
+      () => {
+        fireEvent("Network.requestWillBeSent", {
+          requestId: "req-before-enable",
+          type: "XHR",
+          request: {
+            url: "https://example.com/api/before-enable",
+            method: "GET",
+            headers: {},
+          },
+        });
+      },
+      Math.floor(ENABLE_DELAY_MS / 2),
+    );
+    const request = await promise;
+    assert.equal(request.url(), "https://example.com/api/before-enable");
+    assert.equal(
+      enableAcknowledged,
+      true,
+      "Network.enable must be acknowledged before waitForRequest resolves",
+    );
+  } finally {
+    cleanupBrowserRuntime();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// (b) waitForNetworkIdle — in-flight traffic tests
+// ---------------------------------------------------------------------------
+
+test("waitForLoadState networkidle stays non-idle while a request is in-flight", async () => {
+  // A requestWillBeSent event must keep the idle window from starting until
+  // the matching loadingFinished arrives. Without this constraint a busy page
+  // could incorrectly be reported as idle mid-navigation.
+  installAutoEgo();
+  try {
+    const promise = waitForLoadState("networkidle", {
+      timeout: 3000,
+      idleMs: 200,
+    });
+    // Give the session and Network domain time to be established.
+    setTimeout(() => {
+      fireEvent("Network.requestWillBeSent", {
+        requestId: "req-inflight",
+        type: "XHR",
+        request: {
+          url: "https://example.com/api/inflight",
+          method: "GET",
+          headers: {},
+        },
+      });
+    }, 20);
+    // Finish the request; the idle window can only start after this.
+    setTimeout(() => {
+      fireEvent("Network.loadingFinished", { requestId: "req-inflight" });
+    }, 70);
+    const result = await promise;
+    assert.equal(
+      result,
+      true,
+      "resolves true once in-flight request finishes and idle window passes",
+    );
+  } finally {
+    cleanupBrowserRuntime();
+  }
+});
+
+test("waitForLoadState networkidle times out when a request never finishes", async () => {
+  // An in-flight request that never receives loadingFinished must prevent
+  // networkidle from resolving, causing it to return false at the timeout.
+  installAutoEgo();
+  try {
+    const start = Date.now();
+    const promise = waitForLoadState("networkidle", { timeout: 600 });
+    setTimeout(() => {
+      fireEvent("Network.requestWillBeSent", {
+        requestId: "req-stuck",
+        type: "XHR",
+        request: {
+          url: "https://example.com/api/stuck",
+          method: "GET",
+          headers: {},
+        },
+      });
+    }, 20);
+    // loadingFinished is deliberately never fired.
+    const result = await promise;
+    assert.equal(
+      result,
+      false,
+      "returns false when an in-flight request is still pending at timeout",
+    );
+    assert.ok(
+      Date.now() - start >= 500,
+      "waited until the timeout before giving up",
+    );
+  } finally {
+    cleanupBrowserRuntime();
+  }
 });

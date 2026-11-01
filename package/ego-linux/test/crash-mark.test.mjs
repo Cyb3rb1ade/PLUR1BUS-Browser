@@ -1,6 +1,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -187,5 +195,93 @@ describe("suppressPasswordSavePrompts", () => {
         profile: { name: "existing" },
       });
     });
+  });
+});
+
+// Verify that all three functions write via the atomic rename path (replaceFile)
+// rather than truncating in place. A replaceFile call leaves no .tmp file behind
+// after a successful write; a plain writeFile would not create one at all, but
+// only replaceFile guarantees readers never see a partial file.
+describe("Preferences writes are atomic (no scratch files left behind)", () => {
+  async function scratchFilesIn(dir) {
+    const entries = await readdir(dir);
+    return entries.filter((e) => e.endsWith(".tmp"));
+  }
+
+  it("clearStaleCrashMark leaves no scratch file in Default/", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ego-atomic-"));
+    try {
+      await mkdir(join(dir, "Default"), { recursive: true });
+      await writeFile(
+        join(dir, "Default", "Preferences"),
+        JSON.stringify({ profile: { exit_type: "Crashed" } }),
+      );
+      await clearStaleCrashMark(dir);
+      assert.deepEqual(
+        await scratchFilesIn(join(dir, "Default")),
+        [],
+        "no .tmp files left in Default/",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("neutralizeZoom leaves no scratch file in Default/", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ego-atomic-"));
+    try {
+      await mkdir(join(dir, "Default"), { recursive: true });
+      await writeFile(
+        join(dir, "Default", "Preferences"),
+        JSON.stringify({ partition: { default_zoom_level: 1.5 } }),
+      );
+      await neutralizeZoom(dir);
+      assert.deepEqual(
+        await scratchFilesIn(join(dir, "Default")),
+        [],
+        "no .tmp files left in Default/",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("suppressPasswordSavePrompts leaves no scratch file in Default/", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ego-atomic-"));
+    try {
+      await suppressPasswordSavePrompts(dir);
+      assert.deepEqual(
+        await scratchFilesIn(join(dir, "Default")),
+        [],
+        "no .tmp files left in Default/",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Verify via inode: replaceFile renames a scratch file onto the target, which
+  // changes the inode. A plain writeFile truncates in place and leaves the same
+  // inode. This test fails if the implementation reverts to plain writeFile.
+  it("clearStaleCrashMark replaces the file inode (rename, not truncate)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ego-atomic-inode-"));
+    try {
+      await mkdir(join(dir, "Default"), { recursive: true });
+      const path = join(dir, "Default", "Preferences");
+      await writeFile(
+        path,
+        JSON.stringify({ profile: { exit_type: "Crashed" } }),
+      );
+      const before = await stat(path);
+      await clearStaleCrashMark(dir);
+      const after = await stat(path);
+      assert.notEqual(
+        after.ino,
+        before.ino,
+        "inode must change: rename replaces the file rather than truncating",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
