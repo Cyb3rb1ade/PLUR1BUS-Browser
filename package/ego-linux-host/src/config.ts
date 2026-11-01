@@ -69,8 +69,19 @@ function nonNegativeNumber(
   fileValue: number | undefined,
   fallback: number,
 ): number {
-  const value = envValue !== undefined ? Number(envValue) : Number(fileValue ?? fallback);
+  const value =
+    envValue !== undefined ? Number(envValue) : Number(fileValue ?? fallback);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function portNumber(
+  envValue: string | undefined,
+  fileValue: number | undefined,
+  fallback: number,
+): number {
+  const raw = envValue?.trim() ? envValue : String(fileValue ?? fallback);
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
 }
 
 /**
@@ -103,14 +114,9 @@ export async function loadConfig(
     userDataDir = defaultProfileDir(env);
   }
 
-  let cdpPort: number;
-  if (env.EGO_CDP_PORT) {
-    cdpPort = Number(env.EGO_CDP_PORT);
-  } else if (file.cdpPort !== undefined) {
-    cdpPort = Number(file.cdpPort);
-  } else {
-    cdpPort = defaultCdpPort(env);
-  }
+  // defaultCdpPort re-reads EGO_CDP_PORT; use the literal 9222 so an invalid
+  // env value doesn't poison the fallback path too.
+  const cdpPort = portNumber(env.EGO_CDP_PORT, file.cdpPort, 9222);
 
   const headlessEnv = parseTruthy(env.EGO_HEADLESS);
   const headless =
